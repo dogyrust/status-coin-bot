@@ -358,6 +358,32 @@ class StatusBot(commands.Bot):
 bot = StatusBot()
 
 
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    if isinstance(error, app_commands.CheckFailure):
+        # Authorisation message was already sent in the check itself.
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.send_message(
+                    "You can't use that command.", ephemeral=True
+                )
+            except discord.HTTPException:
+                pass
+        return
+    log.exception("Unhandled app command error: %s", error)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("Something went wrong.", ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                "Something went wrong.", ephemeral=True
+            )
+    except discord.HTTPException:
+        pass
+
+
 async def live_total(guild_id, user_id, settings):
     """DB total plus any not-yet-flushed live time."""
     u = await bot.db.get_user(guild_id, user_id)
@@ -736,11 +762,20 @@ async def buy(interaction: discord.Interaction, product: app_commands.Choice[str
 
 # --------------------------- admin commands ---------------------------
 @app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
 class AdminGroup(app_commands.Group):
     def __init__(self, bot_: StatusBot):
         super().__init__(name="admin", description="Status-coin bot administration")
         self.bot = bot_
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id in config.ADMIN_USER_IDS:
+            return True
+        msg = "\u26D4 You're not authorised to use the admin commands."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        return False
 
     @app_commands.command(name="accounts", description="List real NFA account types, prices and stock")
     async def accounts_cmd(self, interaction: discord.Interaction):

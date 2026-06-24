@@ -19,6 +19,14 @@ def _get_int(name, default=None):
     return default
 
 
+def _get_id_set(name, default):
+    raw = os.getenv(name)
+    if not raw:
+        return set(default)
+    ids = {int(p) for p in raw.replace(",", " ").split() if p.strip().isdigit()}
+    return ids or set(default)
+
+
 # --- Required ---
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
@@ -29,6 +37,13 @@ GUILD_ID = _get_int("GUILD_ID")
 # Members with THIS role (or any higher role in the hierarchy) may run
 # /check on other members. Override with the ADMIN_ROLE_ID env var.
 ADMIN_ROLE_ID = _get_int("ADMIN_ROLE_ID", 1323908939074502684)
+
+# ONLY these user IDs may use the /admin commands. Override with ADMIN_USER_IDS
+# (space- or comma-separated list of user IDs).
+ADMIN_USER_IDS = _get_id_set(
+    "ADMIN_USER_IDS",
+    [424905705909387265, 610910145668448256, 646442234618576916],
+)
 
 # --- Default reward settings (changeable per-server via /admin) ---
 DEFAULT_REQUIRED_STATUS = os.getenv("REQUIRED_STATUS", "$1.20 Rust: nfaccount.com")
