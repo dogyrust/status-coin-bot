@@ -6,8 +6,6 @@ By default: 1 coin per 48h of eligible online time.
 
 Only time while online/dnd AND showing the status counts toward the 48h.
 """
-import base64
-import io
 import logging
 import time
 
@@ -589,54 +587,34 @@ async def _safe_followup(interaction, **kwargs):
         return False
 
 
-async def _deliver_account(interaction: discord.Interaction, tier, data):
-    """DM the buyer their account + loader; never raises."""
+ACTIVATION_URL = "https://nordicnfas.com/"
+
+
+async def _deliver_key(interaction: discord.Interaction, tier, key):
+    """DM the buyer their activation key + instructions; never raises."""
     label = tier.get("label", tier["account_type"])
-    lines = [f"**{label}** \u2014 your purchase is ready! \U0001F389"]
-    if data.get("activation_key"):
-        lines.append(f"**Activation key:** `{data['activation_key']}`")
-    account = data.get("account")
-    if isinstance(account, dict):
-        for k, v in account.items():
-            lines.append(f"**{k}:** `{v}`")
-    if data.get("message"):
-        lines.append(f"\n{data['message']}")
-    content = "\n".join(lines)
-
-    raw = None
-    exe_name = data.get("exe_filename") or "loader.exe"
-    if data.get("exe_base64"):
-        try:
-            raw = base64.b64decode(data["exe_base64"])
-        except Exception as exc:  # noqa: BLE001
-            log.warning("exe decode failed: %s", exc)
-
-    def make_files():
-        return [discord.File(io.BytesIO(raw), filename=exe_name)] if raw else []
-
+    content = (
+        f"\U0001F389 **{label}** \u2014 here's your key!\n\n"
+        f"**Your key:** ||`{key}`||\n\n"
+        f"**How to use it:**\n"
+        f"1. Go to {ACTIVATION_URL}\n"
+        f"2. Enter your key there to activate and download your account.\n\n"
+        f"Keep this key private \u2014 treat it like cash."
+    )
     try:
         dm = await interaction.user.create_dm()
-        await dm.send(content=content, files=make_files())
+        await dm.send(content=content)
         await _safe_followup(
             interaction,
-            content="\u2705 Purchase complete \u2014 check your **DMs** for the account and loader!",
+            content="\u2705 Purchase complete \u2014 check your **DMs** for your key!",
             ephemeral=True,
         )
         return
     except Exception as exc:  # noqa: BLE001
         log.warning("DM delivery failed: %s", exc)
-
-    if await _safe_followup(
-        interaction,
-        content="\u2705 Purchase complete! (I couldn't DM you, so here it is privately:)\n\n" + content,
-        files=make_files(),
-        ephemeral=True,
-    ):
-        return
     await _safe_followup(
         interaction,
-        content="\u2705 Purchase complete. I couldn't attach the loader here \u2014 "
-        "please enable DMs or contact an admin to resend.\n\n" + content,
+        content="\u2705 Purchase complete! (I couldn't DM you, so here it is privately:)\n\n" + content,
         ephemeral=True,
     )
 
@@ -663,7 +641,7 @@ async def _announce_purchase(guild, user_id, tier):
         pass
 
 
-@bot.tree.command(name="buy", description="Spend coins to instantly receive an account")
+@bot.tree.command(name="buy", description="Spend coins to receive an account key")
 @app_commands.guild_only()
 @app_commands.choices(product=_STORE_CHOICES)
 @app_commands.describe(product="Which account to buy")
@@ -714,37 +692,27 @@ async def buy(interaction: discord.Interaction, product: app_commands.Choice[str
         except Exception as exc:  # noqa: BLE001
             log.warning("stock precheck failed: %s", exc)
 
-        try:
-            _, status = await bot.nfa_get("/api/v1/status")
-            if isinstance(status, dict) and status.get("steam_down"):
-                await _safe_followup(
-                    interaction,
-                    content="Steam is currently down \u2014 try again in ~1 minute. "
-                    "You were not charged.",
-                    ephemeral=True,
-                )
-                return
-        except Exception as exc:  # noqa: BLE001
-            log.warning("status precheck failed: %s", exc)
-
         # Reserve coins; refund on any failure below.
         await bot.db.add_coins(guild_id, uid, -cost)
         try:
             _, data = await bot.nfa_post(
-                "/api/v1/activate_direct", {"account_type": account_type}, timeout=180
+                "/api/v1/create_keys",
+                {"account_type": account_type, "amount": 1},
+                timeout=30,
             )
         except Exception as exc:  # noqa: BLE001
             await bot.db.add_coins(guild_id, uid, cost)
-            log.warning("activate_direct error: %s", exc)
+            log.warning("create_keys error: %s", exc)
             await _safe_followup(
                 interaction,
-                content="The store timed out while claiming your account. "
+                content="The store errored while generating your key. "
                 "You were **refunded** \u2014 please try again shortly.",
                 ephemeral=True,
             )
             return
 
-        if not isinstance(data, dict) or data.get("status") != "success":
+        keys = data.get("keys") if isinstance(data, dict) else None
+        if not isinstance(data, dict) or data.get("status") != "success" or not keys:
             await bot.db.add_coins(guild_id, uid, cost)
             msg = data.get("message") if isinstance(data, dict) else "Unknown error"
             await _safe_followup(
@@ -754,7 +722,7 @@ async def buy(interaction: discord.Interaction, product: app_commands.Choice[str
             )
             return
 
-        await _deliver_account(interaction, tier, data)
+        await _deliver_key(interaction, tier, keys[0])
         await _announce_purchase(interaction.guild, uid, tier)
     finally:
         bot._buying.discard(key)
