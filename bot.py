@@ -6,6 +6,8 @@ By default: 1 coin per 48h of eligible online time.
 
 Only time while online/dnd AND showing the status counts toward the 48h.
 """
+import base64
+import io
 import logging
 import time
 
@@ -118,6 +120,7 @@ class StatusBot(commands.Bot):
         self._settings_cache = {}
         self.session = None
         self._store_cache = None
+        self._buying = set()
 
     async def setup_hook(self):
         await self.db.connect()
@@ -152,6 +155,16 @@ class StatusBot(commands.Bot):
         timeout = aiohttp.ClientTimeout(total=20)
         async with self.session.get(
             url, params=params, headers=headers, timeout=timeout
+        ) as resp:
+            data = await resp.json(content_type=None)
+            return resp.status, data
+
+    async def nfa_post(self, path, payload, timeout=30):
+        url = f"{config.NFA_API_BASE}{path}"
+        headers = {"X-API-Key": config.NFA_API_KEY}
+        client_timeout = aiohttp.ClientTimeout(total=timeout)
+        async with self.session.post(
+            url, json=payload, headers=headers, timeout=client_timeout
         ) as resp:
             data = await resp.json(content_type=None)
             return resp.status, data
@@ -515,6 +528,195 @@ async def store(interaction: discord.Interaction):
     )
     embed.set_footer(text=f"See your {config.COIN_NAME}s with /balance \u00b7 stock is live")
     await interaction.followup.send(embed=embed)
+
+
+_STORE_CHOICES = [
+    app_commands.Choice(
+        name=f"{t.get('label', t['account_type'])} ({t.get('cost', 0)} {config.COIN_NAME})"[:100],
+        value=t["account_type"],
+    )
+    for t in config.STORE_TIERS
+][:25]
+
+
+async def _safe_followup(interaction, **kwargs):
+    try:
+        await interaction.followup.send(**kwargs)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("followup failed: %s", exc)
+        return False
+
+
+async def _deliver_account(interaction: discord.Interaction, tier, data):
+    """DM the buyer their account + loader; never raises."""
+    label = tier.get("label", tier["account_type"])
+    lines = [f"**{label}** \u2014 your purchase is ready! \U0001F389"]
+    if data.get("activation_key"):
+        lines.append(f"**Activation key:** `{data['activation_key']}`")
+    account = data.get("account")
+    if isinstance(account, dict):
+        for k, v in account.items():
+            lines.append(f"**{k}:** `{v}`")
+    if data.get("message"):
+        lines.append(f"\n{data['message']}")
+    content = "\n".join(lines)
+
+    raw = None
+    exe_name = data.get("exe_filename") or "loader.exe"
+    if data.get("exe_base64"):
+        try:
+            raw = base64.b64decode(data["exe_base64"])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("exe decode failed: %s", exc)
+
+    def make_files():
+        return [discord.File(io.BytesIO(raw), filename=exe_name)] if raw else []
+
+    try:
+        dm = await interaction.user.create_dm()
+        await dm.send(content=content, files=make_files())
+        await _safe_followup(
+            interaction,
+            content="\u2705 Purchase complete \u2014 check your **DMs** for the account and loader!",
+            ephemeral=True,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.warning("DM delivery failed: %s", exc)
+
+    if await _safe_followup(
+        interaction,
+        content="\u2705 Purchase complete! (I couldn't DM you, so here it is privately:)\n\n" + content,
+        files=make_files(),
+        ephemeral=True,
+    ):
+        return
+    await _safe_followup(
+        interaction,
+        content="\u2705 Purchase complete. I couldn't attach the loader here \u2014 "
+        "please enable DMs or contact an admin to resend.\n\n" + content,
+        ephemeral=True,
+    )
+
+
+async def _announce_purchase(guild, user_id, tier):
+    settings = await bot.get_guild_settings(guild.id)
+    chan_id = settings.get("log_channel_id")
+    if not chan_id:
+        return
+    channel = guild.get_channel(int(chan_id))
+    if channel is None:
+        return
+    member = guild.get_member(user_id)
+    who = member.mention if member else f"<@{user_id}>"
+    embed = discord.Embed(
+        title=f"{config.COIN_EMOJI} Purchase",
+        description=f"{who} bought **{tier.get('label', tier['account_type'])}** "
+        f"for **{tier.get('cost', 0)}** {config.COIN_NAME}(s).",
+        color=config.EMBED_COLOR,
+    )
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        pass
+
+
+@bot.tree.command(name="buy", description="Spend coins to instantly receive an account")
+@app_commands.guild_only()
+@app_commands.choices(product=_STORE_CHOICES)
+@app_commands.describe(product="Which account to buy")
+async def buy(interaction: discord.Interaction, product: app_commands.Choice[str]):
+    account_type = product.value
+    tier = next((t for t in config.STORE_TIERS if t["account_type"] == account_type), None)
+    if tier is None:
+        await interaction.response.send_message("Unknown product.", ephemeral=True)
+        return
+    if not config.NFA_API_KEY:
+        await interaction.response.send_message(
+            "The store isn't configured yet (an admin must set `NFA_API_KEY`).",
+            ephemeral=True,
+        )
+        return
+
+    cost = int(tier.get("cost", 0))
+    guild_id, uid = interaction.guild_id, interaction.user.id
+    key = (guild_id, uid)
+    if key in bot._buying:
+        await interaction.response.send_message(
+            "You already have a purchase in progress \u2014 please wait.", ephemeral=True
+        )
+        return
+
+    u = await bot.db.get_user(guild_id, uid)
+    if u["coins"] < cost:
+        await interaction.response.send_message(
+            f"You need **{cost}** {config.COIN_NAME}(s) but only have **{u['coins']}**.",
+            ephemeral=True,
+        )
+        return
+
+    bot._buying.add(key)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        # Pre-checks (no charge if they fail to pass)
+        try:
+            _, stock = await bot.get_store()
+            count = extract_stock(stock, account_type)
+            if count is not None and count <= 0:
+                await _safe_followup(
+                    interaction,
+                    content="That account is **out of stock** right now. You were not charged.",
+                    ephemeral=True,
+                )
+                return
+        except Exception as exc:  # noqa: BLE001
+            log.warning("stock precheck failed: %s", exc)
+
+        try:
+            _, status = await bot.nfa_get("/api/v1/status")
+            if isinstance(status, dict) and status.get("steam_down"):
+                await _safe_followup(
+                    interaction,
+                    content="Steam is currently down \u2014 try again in ~1 minute. "
+                    "You were not charged.",
+                    ephemeral=True,
+                )
+                return
+        except Exception as exc:  # noqa: BLE001
+            log.warning("status precheck failed: %s", exc)
+
+        # Reserve coins; refund on any failure below.
+        await bot.db.add_coins(guild_id, uid, -cost)
+        try:
+            _, data = await bot.nfa_post(
+                "/api/v1/activate_direct", {"account_type": account_type}, timeout=180
+            )
+        except Exception as exc:  # noqa: BLE001
+            await bot.db.add_coins(guild_id, uid, cost)
+            log.warning("activate_direct error: %s", exc)
+            await _safe_followup(
+                interaction,
+                content="The store timed out while claiming your account. "
+                "You were **refunded** \u2014 please try again shortly.",
+                ephemeral=True,
+            )
+            return
+
+        if not isinstance(data, dict) or data.get("status") != "success":
+            await bot.db.add_coins(guild_id, uid, cost)
+            msg = data.get("message") if isinstance(data, dict) else "Unknown error"
+            await _safe_followup(
+                interaction,
+                content=f"Purchase failed: {msg}\nYou were **refunded**.",
+                ephemeral=True,
+            )
+            return
+
+        await _deliver_account(interaction, tier, data)
+        await _announce_purchase(interaction.guild, uid, tier)
+    finally:
+        bot._buying.discard(key)
 
 
 # --------------------------- admin commands ---------------------------
