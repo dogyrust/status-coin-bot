@@ -4,6 +4,7 @@ Most values here are just DEFAULTS. Per-server settings (required status text,
 reward interval, coins per reward, log channel) are stored in the database and
 can be changed at runtime with the /admin commands.
 """
+import json
 import os
 
 from dotenv import load_dotenv
@@ -48,3 +49,20 @@ BOT_ACTIVITY_TYPE = os.getenv("BOT_ACTIVITY_TYPE", "custom").lower()
 STREAM_URL = os.getenv("STREAM_URL", "https://www.twitch.tv/discord")
 
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+
+# --- NFA Resell API (powers /store) ---
+# Set NFA_API_KEY as an environment variable / Railway secret. Never hardcode it.
+NFA_API_KEY = os.getenv("NFA_API_KEY", "").strip()
+NFA_API_BASE = os.getenv("NFA_API_BASE", "https://nfa-api.acode.ing").rstrip("/")
+
+# --- Store products (priced in the bot's coins, not USD) ---
+# Override with a STORE_TIERS env var (JSON list) if you want to change them.
+DEFAULT_STORE_TIERS = [
+    {"account_type": "rust_0_250_hours", "label": "Rust 0-250 hours (Base)", "cost": 1},
+    {"account_type": "rust_500_1000_hours", "label": "Rust 500-1000 hours", "cost": 3},
+    {"account_type": "rust_3000_7000_hours", "label": "Rust 3000-7000 hours", "cost": 4},
+]
+try:
+    STORE_TIERS = json.loads(os.getenv("STORE_TIERS", "")) or DEFAULT_STORE_TIERS
+except (ValueError, TypeError):
+    STORE_TIERS = DEFAULT_STORE_TIERS

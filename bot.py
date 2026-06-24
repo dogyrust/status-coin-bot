@@ -9,6 +9,7 @@ Only time while online/dnd AND showing the status counts toward the 48h.
 import logging
 import time
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -92,6 +93,21 @@ def build_activity():
     return discord.CustomActivity(name=text)
 
 
+def extract_stock(stock, account_type):
+    """Pull a numeric stock count for an account type from the /stock payload."""
+    value = stock.get(account_type) if isinstance(stock, dict) else None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, dict):
+        for key in ("stock", "count", "available", "amount", "qty"):
+            v = value.get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return int(v)
+    return None
+
+
 # --------------------------- bot ---------------------------
 class StatusBot(commands.Bot):
     def __init__(self):
@@ -100,9 +116,12 @@ class StatusBot(commands.Bot):
         # (guild_id, user_id) -> unix timestamp when they became eligible.
         self.eligible_since = {}
         self._settings_cache = {}
+        self.session = None
+        self._store_cache = None
 
     async def setup_hook(self):
         await self.db.connect()
+        self.session = aiohttp.ClientSession()
         self.tree.add_command(AdminGroup(self))
         if config.GUILD_ID:
             guild = discord.Object(id=config.GUILD_ID)
@@ -125,6 +144,30 @@ class StatusBot(commands.Bot):
 
     def invalidate_settings(self, guild_id):
         self._settings_cache.pop(guild_id, None)
+
+    # ----- NFA Resell API (powers /store) -----
+    async def nfa_get(self, path, params=None):
+        url = f"{config.NFA_API_BASE}{path}"
+        headers = {"X-API-Key": config.NFA_API_KEY}
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with self.session.get(
+            url, params=params, headers=headers, timeout=timeout
+        ) as resp:
+            data = await resp.json(content_type=None)
+            return resp.status, data
+
+    async def get_store(self):
+        """Return (accounts: {name: price}, stock: {name: count}); cached ~15s."""
+        now = time.time()
+        if self._store_cache and now - self._store_cache[0] < 15:
+            return self._store_cache[1]
+        _, acc = await self.nfa_get("/api/v1/accounts")
+        _, stk = await self.nfa_get("/api/v1/stock")
+        accounts = acc.get("accounts", {}) if isinstance(acc, dict) else {}
+        stock = stk.get("stock", {}) if isinstance(stk, dict) else {}
+        result = (accounts, stock)
+        self._store_cache = (now, result)
+        return result
 
     # ----- eligibility + time accounting -----
     def is_eligible(self, member, settings):
@@ -279,6 +322,8 @@ class StatusBot(commands.Bot):
         for (gid, uid) in list(self.eligible_since.keys()):
             await self.flush_user(gid, uid, now)
         await self.db.close()
+        if self.session:
+            await self.session.close()
         await super().close()
 
 
@@ -327,6 +372,13 @@ async def balance(interaction: discord.Interaction, user: discord.Member = None)
 @app_commands.guild_only()
 @app_commands.describe(user="Member to check (defaults to you)")
 async def check(interaction: discord.Interaction, user: discord.Member = None):
+    if user is not None and not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "Only admins can check another member's status. "
+            "Use `/check` on its own to check yourself.",
+            ephemeral=True,
+        )
+        return
     target = user or interaction.user
     # Re-fetch from the guild cache so we read live presence (status + custom
     # activity); the member resolved straight from a slash command can lack it.
@@ -429,6 +481,42 @@ async def howitworks(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="store", description="Browse the account shop (prices are in coins)")
+@app_commands.guild_only()
+async def store(interaction: discord.Interaction):
+    await interaction.response.defer()
+    stock = {}
+    if config.NFA_API_KEY:
+        try:
+            _, stock = await bot.get_store()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Store stock fetch failed: %s", exc)
+    lines = []
+    for tier in config.STORE_TIERS:
+        at = tier.get("account_type", "")
+        label = tier.get("label", at)
+        cost = tier.get("cost", 0)
+        count = extract_stock(stock, at)
+        if count is None:
+            dot, stock_str = "\u26AA", "stock: n/a"
+        elif count > 0:
+            dot, stock_str = "\U0001F7E2", f"{count} in stock"
+        else:
+            dot, stock_str = "\U0001F534", "out of stock"
+        lines.append(
+            f"{dot} **{label}**\n"
+            f"`{at}` \u2014 **{cost}** {config.COIN_EMOJI} {config.COIN_NAME}(s) "
+            f"\u00b7 {stock_str}"
+        )
+    embed = discord.Embed(
+        title="\U0001F6D2 Account Store",
+        description="\n\n".join(lines) if lines else "No products configured.",
+        color=config.EMBED_COLOR,
+    )
+    embed.set_footer(text=f"See your {config.COIN_NAME}s with /balance \u00b7 stock is live")
+    await interaction.followup.send(embed=embed)
+
+
 # --------------------------- admin commands ---------------------------
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
@@ -436,6 +524,34 @@ class AdminGroup(app_commands.Group):
     def __init__(self, bot_: StatusBot):
         super().__init__(name="admin", description="Status-coin bot administration")
         self.bot = bot_
+
+    @app_commands.command(name="accounts", description="List real NFA account types, prices and stock")
+    async def accounts_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        if not config.NFA_API_KEY:
+            await interaction.followup.send("NFA_API_KEY is not set.", ephemeral=True)
+            return
+        try:
+            accounts, stock = await self.bot.get_store()
+        except Exception as exc:  # noqa: BLE001
+            await interaction.followup.send(f"API error: `{exc}`", ephemeral=True)
+            return
+        if not accounts:
+            await interaction.followup.send(
+                "No account types returned (check the API key).", ephemeral=True
+            )
+            return
+        lines = []
+        for name, price in sorted(accounts.items()):
+            count = extract_stock(stock, name)
+            count_str = count if count is not None else "n/a"
+            lines.append(f"`{name}` \u2014 ${price} \u00b7 {count_str} stock")
+        embed = discord.Embed(
+            title="NFA Account Types (live)",
+            description="\n".join(lines)[:4000],
+            color=config.EMBED_COLOR,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="addcoins", description="Add (or subtract) a user's coins")
     @app_commands.describe(user="Member", amount="Amount (use a negative number to remove)")
