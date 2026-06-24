@@ -591,7 +591,7 @@ ACTIVATION_URL = "https://nordicnfas.com/"
 
 
 async def _deliver_key(interaction: discord.Interaction, tier, key):
-    """DM the buyer their activation key + instructions; never raises."""
+    """DM the buyer their key and post a public purchase announcement; never raises."""
     label = tier.get("label", tier["account_type"])
     content = (
         f"\U0001F389 **{label}** \u2014 here's your key!\n\n"
@@ -601,44 +601,42 @@ async def _deliver_key(interaction: discord.Interaction, tier, key):
         f"2. Enter your key there to activate and download your account.\n\n"
         f"Keep this key private \u2014 treat it like cash."
     )
+
+    dm_ok = False
     try:
         dm = await interaction.user.create_dm()
         await dm.send(content=content)
+        dm_ok = True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("DM delivery failed: %s", exc)
+
+    # Public announcement everyone in the channel can see (the key is NOT shown).
+    if interaction.channel is not None:
+        announce = discord.Embed(
+            title=f"{config.COIN_EMOJI} New purchase!",
+            description=f"{interaction.user.mention} just bought **{label}** "
+            f"for **{tier.get('cost', 0)}** {config.COIN_NAME}(s)!",
+            color=config.EMBED_COLOR,
+        )
+        try:
+            await interaction.channel.send(embed=announce)
+        except discord.HTTPException as exc:
+            log.warning("public announce failed: %s", exc)
+
+    # Private confirmation to the buyer (also resolves the ephemeral interaction).
+    if dm_ok:
         await _safe_followup(
             interaction,
             content="\u2705 Purchase complete \u2014 check your **DMs** for your key!",
             ephemeral=True,
         )
-        return
-    except Exception as exc:  # noqa: BLE001
-        log.warning("DM delivery failed: %s", exc)
-    await _safe_followup(
-        interaction,
-        content="\u2705 Purchase complete! (I couldn't DM you, so here it is privately:)\n\n" + content,
-        ephemeral=True,
-    )
-
-
-async def _announce_purchase(guild, user_id, tier):
-    settings = await bot.get_guild_settings(guild.id)
-    chan_id = settings.get("log_channel_id")
-    if not chan_id:
-        return
-    channel = guild.get_channel(int(chan_id))
-    if channel is None:
-        return
-    member = guild.get_member(user_id)
-    who = member.mention if member else f"<@{user_id}>"
-    embed = discord.Embed(
-        title=f"{config.COIN_EMOJI} Purchase",
-        description=f"{who} bought **{tier.get('label', tier['account_type'])}** "
-        f"for **{tier.get('cost', 0)}** {config.COIN_NAME}(s).",
-        color=config.EMBED_COLOR,
-    )
-    try:
-        await channel.send(embed=embed)
-    except discord.HTTPException:
-        pass
+    else:
+        await _safe_followup(
+            interaction,
+            content="\u2705 Purchase complete! I couldn't DM you (are your DMs open?), "
+            "so here's your key privately:\n\n" + content,
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(name="buy", description="Spend coins to receive an account key")
@@ -723,7 +721,6 @@ async def buy(interaction: discord.Interaction, product: app_commands.Choice[str
             return
 
         await _deliver_key(interaction, tier, keys[0])
-        await _announce_purchase(interaction.guild, uid, tier)
     finally:
         bot._buying.discard(key)
 
