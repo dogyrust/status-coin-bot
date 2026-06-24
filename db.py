@@ -1,4 +1,5 @@
 """Async SQLite storage for per-guild settings and per-user balances/time."""
+import os
 import time
 
 import aiosqlite
@@ -27,6 +28,9 @@ class Database:
         self._conn = None
 
     async def connect(self):
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self._conn = await aiosqlite.connect(self.path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL;")
