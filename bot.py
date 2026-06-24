@@ -323,38 +323,45 @@ async def balance(interaction: discord.Interaction, user: discord.Member = None)
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="check", description="See if you currently qualify to earn coins")
+@bot.tree.command(name="check", description="Check if you (or a member) currently qualify to earn coins")
 @app_commands.guild_only()
 @app_commands.describe(user="Member to check (defaults to you)")
 async def check(interaction: discord.Interaction, user: discord.Member = None):
-    user = user or interaction.user
+    target = user or interaction.user
+    # Re-fetch from the guild cache so we read live presence (status + custom
+    # activity); the member resolved straight from a slash command can lack it.
+    member = interaction.guild.get_member(target.id) or target
     settings = await bot.get_guild_settings(interaction.guild_id)
     statuses = parse_statuses(settings["eligible_statuses"])
-    status_ok = user.status in statuses
-    text = get_custom_status_text(user)
+    status_ok = member.status in statuses
+    text = get_custom_status_text(member)
     text_ok = settings["required_status"].strip().lower() in (text or "").lower()
-    eligible = status_ok and text_ok and not user.bot
+    eligible = status_ok and text_ok and not member.bot
+    is_self = member.id == interaction.user.id
     embed = discord.Embed(
-        title="Eligibility Check",
+        title=f"Eligibility Check — {member.display_name}",
         color=discord.Color.green() if eligible else discord.Color.red(),
     )
+    embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(
         name="Online status",
-        value=f"{'✅' if status_ok else '❌'} `{user.status}` "
+        value=f"{'✅' if status_ok else '❌'} `{member.status}` "
         f"(need one of: {settings['eligible_statuses']})",
         inline=False,
     )
     embed.add_field(
         name="Required status text",
         value=f"{'✅' if text_ok else '❌'} must contain: `{settings['required_status']}`\n"
-        f"your status: `{text or '(none set)'}`",
+        f"status shown: `{text or '(none set)'}`",
         inline=False,
     )
-    embed.add_field(
-        name="Currently earning?",
-        value="✅ **Yes** — keep it up!" if eligible else "❌ **No** — fix the above",
-        inline=False,
-    )
+    if eligible:
+        earning = "✅ **Yes** — keep it up!"
+    elif is_self:
+        earning = "❌ **No** — fix the above"
+    else:
+        earning = "❌ **No** — they don't qualify right now"
+    embed.add_field(name="Currently earning?", value=earning, inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
