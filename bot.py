@@ -110,6 +110,21 @@ def extract_stock(stock, account_type):
     return None
 
 
+def can_check_others(member):
+    """True if member may run /check on someone else (admin role or higher)."""
+    guild = getattr(member, "guild", None)
+    if guild is None:
+        return False
+    if member.id == guild.owner_id:
+        return True
+    role = guild.get_role(config.ADMIN_ROLE_ID) if config.ADMIN_ROLE_ID else None
+    if role is None:
+        # Configured role missing? fall back to the Manage Server permission.
+        return member.guild_permissions.manage_guild
+    top = getattr(member, "top_role", None)
+    return top is not None and top.position >= role.position
+
+
 # --------------------------- bot ---------------------------
 class StatusBot(commands.Bot):
     def __init__(self):
@@ -385,9 +400,9 @@ async def balance(interaction: discord.Interaction, user: discord.Member = None)
 @app_commands.guild_only()
 @app_commands.describe(user="Member to check (defaults to you)")
 async def check(interaction: discord.Interaction, user: discord.Member = None):
-    if user is not None and not interaction.user.guild_permissions.manage_guild:
+    if user is not None and not can_check_others(interaction.user):
         await interaction.response.send_message(
-            "Only admins can check another member's status. "
+            "You need the admin role (or higher) to check another member. "
             "Use `/check` on its own to check yourself.",
             ephemeral=True,
         )

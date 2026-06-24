@@ -26,6 +26,10 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 # Leave blank to register commands globally (can take up to ~1 hour the first time).
 GUILD_ID = _get_int("GUILD_ID")
 
+# Members with THIS role (or any higher role in the hierarchy) may run
+# /check on other members. Override with the ADMIN_ROLE_ID env var.
+ADMIN_ROLE_ID = _get_int("ADMIN_ROLE_ID", 1323908939074502684)
+
 # --- Default reward settings (changeable per-server via /admin) ---
 DEFAULT_REQUIRED_STATUS = os.getenv("REQUIRED_STATUS", "$1.20 Rust: nfaccount.com")
 DEFAULT_REWARD_HOURS = float(os.getenv("REWARD_HOURS", "48"))
