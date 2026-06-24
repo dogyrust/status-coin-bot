@@ -68,6 +68,15 @@ class Database:
             )
             """
         )
+        await self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_leaderboards (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL
+            )
+            """
+        )
 
     # ---------- settings ----------
     async def get_settings(self, guild_id, defaults):
@@ -160,3 +169,32 @@ class Database:
             (guild_id, limit),
         )
         return await cur.fetchall()
+
+    # ---------- live leaderboard ----------
+    async def set_live_leaderboard(self, guild_id, channel_id, message_id):
+        await self._conn.execute(
+            "INSERT OR REPLACE INTO live_leaderboards "
+            "(guild_id, channel_id, message_id) VALUES (?,?,?)",
+            (guild_id, channel_id, message_id),
+        )
+        await self._conn.commit()
+
+    async def get_live_leaderboard(self, guild_id):
+        cur = await self._conn.execute(
+            "SELECT guild_id, channel_id, message_id FROM live_leaderboards "
+            "WHERE guild_id=?",
+            (guild_id,),
+        )
+        return await cur.fetchone()
+
+    async def get_all_live_leaderboards(self):
+        cur = await self._conn.execute(
+            "SELECT guild_id, channel_id, message_id FROM live_leaderboards"
+        )
+        return await cur.fetchall()
+
+    async def clear_live_leaderboard(self, guild_id):
+        await self._conn.execute(
+            "DELETE FROM live_leaderboards WHERE guild_id=?", (guild_id,)
+        )
+        await self._conn.commit()

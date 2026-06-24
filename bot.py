@@ -148,6 +148,7 @@ class StatusBot(commands.Bot):
             await self.tree.sync()
             log.info("Slash commands synced globally (may take up to 1h first time)")
         self.reward_loop.start()
+        self.leaderboard_loop.start()
 
     # ----- settings cache -----
     async def get_guild_settings(self, guild_id):
@@ -295,6 +296,34 @@ class StatusBot(commands.Bot):
 
     @reward_loop.before_loop
     async def _before_loop(self):
+        await self.wait_until_ready()
+
+    async def update_live_leaderboards(self):
+        for row in await self.db.get_all_live_leaderboards():
+            guild = self.get_guild(row["guild_id"])
+            if guild is None:
+                continue
+            channel = guild.get_channel(row["channel_id"])
+            if channel is None:
+                await self.db.clear_live_leaderboard(row["guild_id"])
+                continue
+            embed = await build_leaderboard_embed(guild, live=True)
+            try:
+                await channel.get_partial_message(row["message_id"]).edit(embed=embed)
+            except discord.NotFound:
+                await self.db.clear_live_leaderboard(row["guild_id"])
+            except discord.HTTPException as exc:
+                log.warning("Leaderboard update failed: %s", exc)
+
+    @tasks.loop(seconds=60)
+    async def leaderboard_loop(self):
+        try:
+            await self.update_live_leaderboards()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("leaderboard_loop error: %s", exc)
+
+    @leaderboard_loop.before_loop
+    async def _before_leaderboard_loop(self):
         await self.wait_until_ready()
 
     # ----- events -----
@@ -469,22 +498,30 @@ async def check(interaction: discord.Interaction, user: discord.Member = None):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="leaderboard", description="Top coin holders in this server")
-@app_commands.guild_only()
-async def leaderboard(interaction: discord.Interaction):
-    rows = await bot.db.leaderboard(interaction.guild_id, 10)
+async def build_leaderboard_embed(guild, limit=10, live=False):
+    rows = await bot.db.leaderboard(guild.id, limit)
     medals = ["\U0001F947", "\U0001F948", "\U0001F949"]
     lines = []
     for i, row in enumerate(rows):
-        member = interaction.guild.get_member(row["user_id"])
+        member = guild.get_member(row["user_id"])
         name = member.display_name if member else f"User {row['user_id']}"
         prefix = medals[i] if i < 3 else f"`#{i + 1}`"
-        lines.append(f"{prefix} **{name}** — {row['coins']} {config.COIN_NAME}(s)")
+        lines.append(f"{prefix} **{name}** \u2014 {row['coins']} {config.COIN_NAME}(s)")
     embed = discord.Embed(
         title=f"{config.COIN_EMOJI} Leaderboard",
         description="\n".join(lines) if lines else "No one has earned coins yet.",
         color=config.EMBED_COLOR,
+        timestamp=discord.utils.utcnow() if live else None,
     )
+    if live:
+        embed.set_footer(text="Live \u2022 updates every minute")
+    return embed
+
+
+@bot.tree.command(name="leaderboard", description="Top coin holders in this server")
+@app_commands.guild_only()
+async def leaderboard(interaction: discord.Interaction):
+    embed = await build_leaderboard_embed(interaction.guild)
     await interaction.response.send_message(embed=embed)
 
 
@@ -741,6 +778,60 @@ class AdminGroup(app_commands.Group):
         else:
             await interaction.response.send_message(msg, ephemeral=True)
         return False
+
+    @app_commands.command(
+        name="liveleaderboard",
+        description="Post a self-updating leaderboard in a channel",
+    )
+    @app_commands.describe(channel="Channel for the leaderboard (defaults to here)")
+    async def liveleaderboard_cmd(
+        self, interaction: discord.Interaction, channel: discord.TextChannel = None
+    ):
+        channel = channel or interaction.channel
+        existing = await self.bot.db.get_live_leaderboard(interaction.guild_id)
+        if existing:
+            old = interaction.guild.get_channel(existing["channel_id"])
+            if old is not None:
+                try:
+                    await old.get_partial_message(existing["message_id"]).delete()
+                except discord.HTTPException:
+                    pass
+        embed = await build_leaderboard_embed(interaction.guild, live=True)
+        try:
+            message = await channel.send(embed=embed)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"I don't have permission to post in {channel.mention}.", ephemeral=True
+            )
+            return
+        await self.bot.db.set_live_leaderboard(
+            interaction.guild_id, channel.id, message.id
+        )
+        await interaction.response.send_message(
+            f"\u2705 Live leaderboard posted in {channel.mention} \u2014 it refreshes every minute.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="stopleaderboard", description="Stop and remove the live leaderboard"
+    )
+    async def stopleaderboard_cmd(self, interaction: discord.Interaction):
+        existing = await self.bot.db.get_live_leaderboard(interaction.guild_id)
+        if not existing:
+            await interaction.response.send_message(
+                "There's no live leaderboard running.", ephemeral=True
+            )
+            return
+        chan = interaction.guild.get_channel(existing["channel_id"])
+        if chan is not None:
+            try:
+                await chan.get_partial_message(existing["message_id"]).delete()
+            except discord.HTTPException:
+                pass
+        await self.bot.db.clear_live_leaderboard(interaction.guild_id)
+        await interaction.response.send_message(
+            "\u2705 Live leaderboard stopped and removed.", ephemeral=True
+        )
 
     @app_commands.command(name="accounts", description="List real NFA account types, prices and stock")
     async def accounts_cmd(self, interaction: discord.Interaction):
