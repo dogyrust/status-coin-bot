@@ -162,6 +162,21 @@ class Database:
         await self.upsert_user(guild_id, user_id, coins=new)
         return new
 
+    async def try_adjust_coins(self, guild_id, user_id, delta):
+        """Atomically add `delta` coins, refusing to go below zero.
+
+        Returns (ok, balance). When the change would make the balance
+        negative, nothing is written and (False, current_balance) is
+        returned.
+        """
+        u = await self.get_user(guild_id, user_id)
+        current = u["coins"]
+        new = current + delta
+        if new < 0:
+            return False, current
+        await self.upsert_user(guild_id, user_id, coins=new)
+        return True, new
+
     async def leaderboard(self, guild_id, limit=10):
         cur = await self._conn.execute(
             "SELECT user_id, coins FROM users WHERE guild_id=? "
