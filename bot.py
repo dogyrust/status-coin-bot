@@ -16,6 +16,7 @@ from discord.ext import commands, tasks
 
 import config
 from db import Database
+from web_api import CoinApiServer
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
@@ -134,10 +135,12 @@ class StatusBot(commands.Bot):
         self.session = None
         self._store_cache = None
         self._buying = set()
+        self.coin_api = CoinApiServer(self)
 
     async def setup_hook(self):
         await self.db.connect()
         self.session = aiohttp.ClientSession()
+        await self.coin_api.start()
         self.tree.add_command(AdminGroup(self))
         if config.GUILD_ID:
             guild = discord.Object(id=config.GUILD_ID)
@@ -376,6 +379,7 @@ class StatusBot(commands.Bot):
         now = time.time()
         for (gid, uid) in list(self.eligible_since.keys()):
             await self.flush_user(gid, uid, now)
+        await self.coin_api.stop()
         await self.db.close()
         if self.session:
             await self.session.close()
