@@ -86,3 +86,23 @@ sudo docker restart status-coin-bot     # restart
 The bot stores balances in `bot_data.db`. The `-v .../data` volume (Oracle) and the
 `/data` volume (Railway) keep that file safe across restarts/redeploys, with
 `DB_PATH=/data/bot_data.db`. Without a volume, balances reset on each redeploy.
+
+---
+
+## Exposing the coin API (for the gambling site)
+
+The gambling site reads/adjusts balances over an authenticated HTTP API that the
+bot serves in-process. It is **off** until you set `CASINO_API_KEY`.
+
+1. Add these Variables to the service:
+   - `CASINO_API_KEY` = a long random secret (share the same value with the site)
+   - `GUILD_ID` = your server ID (the API serves this guild's balances)
+2. The bot then listens on `PORT` (Railway injects this automatically; locally it
+   defaults to `8080`).
+3. **Railway:** open the service → **Settings → Networking → Generate Domain** to
+   get a public URL like `https://your-bot.up.railway.app`. Use that as the
+   site's `BOT_API_BASE`.
+4. Verify: `curl https://your-bot.up.railway.app/health` → `{"ok": true}`.
+
+The key is only ever used server-side by the site; it is never exposed to
+browsers.
