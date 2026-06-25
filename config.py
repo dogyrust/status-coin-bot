@@ -69,6 +69,15 @@ STREAM_URL = os.getenv("STREAM_URL", "https://www.twitch.tv/discord")
 
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 
+# --- Casino / coin sync HTTP API ---
+# A small authenticated HTTP server that lets the gambling site read and
+# adjust coin balances. Disabled unless CASINO_API_KEY is set.
+CASINO_API_KEY = os.getenv("CASINO_API_KEY", "").strip()
+# Port to listen on. Railway/most hosts inject PORT; fall back to 8080.
+CASINO_API_PORT = _get_int("CASINO_API_PORT") or _get_int("PORT", 8080)
+# Guild whose balances the API serves. Falls back to GUILD_ID.
+CASINO_API_GUILD_ID = _get_int("CASINO_API_GUILD_ID") or GUILD_ID
+
 # --- NFA Resell API (powers /store) ---
 # Set NFA_API_KEY as an environment variable / Railway secret. Never hardcode it.
 NFA_API_KEY = os.getenv("NFA_API_KEY", "").strip()
