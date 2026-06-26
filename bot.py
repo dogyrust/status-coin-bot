@@ -856,8 +856,13 @@ class AdminGroup(app_commands.Group):
         lines = []
         for name, price in sorted(accounts.items()):
             count = extract_stock(stock, name)
-            count_str = count if count is not None else "n/a"
-            lines.append(f"`{name}` \u2014 ${price} \u00b7 {count_str} stock")
+            if count is None:
+                count_str = "stock: n/a"
+            elif count > 0:
+                count_str = f"{count} stock"
+            else:
+                count_str = "out of stock"
+            lines.append(f"`{name}` \u2014 ${price} \u00b7 {count_str}")
         embed = discord.Embed(
             title="NFA Account Types (live)",
             description="\n".join(lines)[:4000],
