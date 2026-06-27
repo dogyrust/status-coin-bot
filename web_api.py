@@ -8,16 +8,18 @@ Endpoints (all under the configured guild):
   GET  /health                      -> {"ok": true}
   GET  /api/coins/balance?user_id=  -> {"user_id", "coins"}
   POST /api/coins/adjust            -> {"user_id", "coins", "applied"}
-       body: {"user_id": <int>, "delta": <int>}
+       body: {"user_id": <int>, "delta": <number>}  (decimals allowed)
 
 All /api/* routes require the header `X-API-Key: <CASINO_API_KEY>`.
 """
 import hmac
 import logging
+import math
 
 from aiohttp import web
 
 import config
+from db import round_coins
 
 log = logging.getLogger("status-coin-bot.web")
 
@@ -109,8 +111,11 @@ class CoinApiServer:
             return web.json_response({"error": "invalid user_id"}, status=400)
 
         delta = body.get("delta")
-        if not isinstance(delta, int) or isinstance(delta, bool):
-            return web.json_response({"error": "delta must be an integer"}, status=400)
+        if isinstance(delta, bool) or not isinstance(delta, (int, float)):
+            return web.json_response({"error": "delta must be a number"}, status=400)
+        if not math.isfinite(delta):
+            return web.json_response({"error": "delta must be finite"}, status=400)
+        delta = round_coins(delta)
 
         ok, balance = await self.bot.db.try_adjust_coins(
             self.guild_id, user_id, delta

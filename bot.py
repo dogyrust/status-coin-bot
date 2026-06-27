@@ -7,6 +7,7 @@ By default: 1 coin per 48h of eligible online time.
 Only time while online/dnd AND showing the status counts toward the 48h.
 """
 import logging
+import math
 import time
 
 import aiohttp
@@ -15,7 +16,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
-from db import Database
+from db import COIN_STEP, Database, round_coins
 from web_api import CoinApiServer
 
 logging.basicConfig(
@@ -59,6 +60,14 @@ def get_custom_status_text(member):
         if isinstance(activity, discord.CustomActivity):
             return activity.name or ""
     return ""
+
+
+def fmt_coins(amount):
+    """Format a coin balance: whole numbers stay clean, fractions show 2 dp."""
+    amount = round_coins(amount)
+    if amount == int(amount):
+        return str(int(amount))
+    return f"{amount:.2f}"
 
 
 def human_duration(seconds):
@@ -241,27 +250,47 @@ class StatusBot(commands.Bot):
             self.eligible_since.pop(key, None)
 
     async def process_rewards(self, guild_id, user_id, settings):
-        """Grant coins for any newly-completed reward intervals. Returns gained."""
+        """Accrue coins continuously toward the reward.
+
+        Instead of granting the whole `coins_per_reward` in one lump at the end
+        of every interval, coins build up in COIN_STEP (0.01) increments
+        proportional to eligible time, reaching `coins_per_reward` after a full
+        interval. Returns (gained, crossed_full_reward).
+        """
         reward_seconds = settings["reward_seconds"]
         if reward_seconds <= 0:
-            return 0
+            return 0.0, False
+        coins_per_reward = float(settings["coins_per_reward"])
         u = await self.db.get_user(guild_id, user_id)
-        target = int(u["total_eligible_seconds"] // reward_seconds)
-        if target > u["rewards_count"]:
-            diff = target - u["rewards_count"]
-            gained = diff * int(settings["coins_per_reward"])
+        total = u["total_eligible_seconds"]
+
+        # Coins the member is entitled to so far, quantised down to whole cents
+        # so we never credit a fraction smaller than COIN_STEP.
+        raw = (total / reward_seconds) * coins_per_reward
+        entitled = round_coins(math.floor(raw / COIN_STEP) * COIN_STEP)
+        already = round_coins(u["earned_coins"])
+        gained = round_coins(entitled - already)
+
+        # Whole completed intervals, used only to announce milestones (not spam
+        # the log every cent).
+        new_count = int(total // reward_seconds)
+        crossed = new_count > u["rewards_count"]
+
+        if gained > 0:
             await self.db.upsert_user(
                 guild_id,
                 user_id,
-                coins=u["coins"] + gained,
-                rewards_count=target,
+                coins=round_coins(u["coins"] + gained),
+                earned_coins=entitled,
+                rewards_count=new_count,
             )
-            return gained
-        return 0
+        elif crossed:
+            await self.db.upsert_user(guild_id, user_id, rewards_count=new_count)
+        return gained, crossed
 
-    async def announce_reward(self, guild, user_id, gained, settings):
+    async def announce_reward(self, guild, user_id, settings):
         u = await self.db.get_user(guild.id, user_id)
-        log.info("Rewarded %s coin(s) to %s in guild %s", gained, user_id, guild.id)
+        log.info("%s reached a full reward in guild %s", user_id, guild.id)
         chan_id = settings.get("log_channel_id")
         if not chan_id:
             return
@@ -270,12 +299,13 @@ class StatusBot(commands.Bot):
             return
         member = guild.get_member(user_id)
         who = member.mention if member else f"<@{user_id}>"
+        per = fmt_coins(settings["coins_per_reward"])
         embed = discord.Embed(
             title=f"{config.COIN_EMOJI} Reward Earned!",
             description=(
-                f"{who} earned **{gained} {config.COIN_NAME}(s)** for staying "
+                f"{who} earned **{per} {config.COIN_NAME}(s)** for staying "
                 f"online with the required status.\n"
-                f"New balance: **{u['coins']} {config.COIN_NAME}(s)**"
+                f"New balance: **{fmt_coins(u['coins'])} {config.COIN_NAME}(s)**"
             ),
             color=config.EMBED_COLOR,
         )
@@ -293,9 +323,9 @@ class StatusBot(commands.Bot):
             keys = [k for k in list(self.eligible_since.keys()) if k[0] == guild.id]
             for (gid, uid) in keys:
                 await self.flush_user(gid, uid, now)
-                gained = await self.process_rewards(gid, uid, settings)
-                if gained > 0:
-                    await self.announce_reward(guild, uid, gained, settings)
+                _, crossed = await self.process_rewards(gid, uid, settings)
+                if crossed:
+                    await self.announce_reward(guild, uid, settings)
 
     @reward_loop.before_loop
     async def _before_loop(self):
@@ -368,9 +398,9 @@ class StatusBot(commands.Bot):
             await self.mark_ineligible(guild_id, member.id, now)
         elif eligible and was:
             await self.flush_user(guild_id, member.id, now)
-            gained = await self.process_rewards(guild_id, member.id, settings)
-            if gained > 0:
-                await self.announce_reward(member.guild, member.id, gained, settings)
+            _, crossed = await self.process_rewards(guild_id, member.id, settings)
+            if crossed:
+                await self.announce_reward(member.guild, member.id, settings)
 
     async def on_member_remove(self, member):
         self.eligible_since.pop((member.guild.id, member.id), None)
@@ -441,7 +471,7 @@ async def balance(interaction: discord.Interaction, user: discord.Member = None)
         title=f"{config.COIN_EMOJI} {user.display_name}'s Balance",
         color=config.EMBED_COLOR,
     )
-    embed.add_field(name="Coins", value=f"**{u['coins']}** {config.COIN_NAME}(s)", inline=True)
+    embed.add_field(name="Coins", value=f"**{fmt_coins(u['coins'])}** {config.COIN_NAME}(s)", inline=True)
     embed.add_field(name="Rewards earned", value=str(u["rewards_count"]), inline=True)
     embed.add_field(name="Total online time", value=human_duration(total), inline=False)
     embed.add_field(
@@ -510,7 +540,7 @@ async def build_leaderboard_embed(guild, limit=10, live=False):
         member = guild.get_member(row["user_id"])
         name = member.display_name if member else f"User {row['user_id']}"
         prefix = medals[i] if i < 3 else f"`#{i + 1}`"
-        lines.append(f"{prefix} **{name}** \u2014 {row['coins']} {config.COIN_NAME}(s)")
+        lines.append(f"{prefix} **{name}** \u2014 {fmt_coins(row['coins'])} {config.COIN_NAME}(s)")
     embed = discord.Embed(
         title=f"{config.COIN_EMOJI} Leaderboard",
         description="\n".join(lines) if lines else "No one has earned coins yet.",
@@ -531,10 +561,13 @@ async def leaderboard(interaction: discord.Interaction):
 
 @bot.tree.command(name="pay", description="Send some of your coins to another member")
 @app_commands.guild_only()
-@app_commands.describe(user="Recipient", amount="How many coins to send")
-async def pay(interaction: discord.Interaction, user: discord.Member, amount: int):
-    if amount <= 0:
-        await interaction.response.send_message("Amount must be positive.", ephemeral=True)
+@app_commands.describe(user="Recipient", amount="How many coins to send (decimals allowed)")
+async def pay(interaction: discord.Interaction, user: discord.Member, amount: float):
+    amount = round_coins(amount)
+    if amount < COIN_STEP:
+        await interaction.response.send_message(
+            f"Amount must be at least {fmt_coins(COIN_STEP)}.", ephemeral=True
+        )
         return
     if user.id == interaction.user.id or user.bot:
         await interaction.response.send_message("Invalid recipient.", ephemeral=True)
@@ -548,7 +581,7 @@ async def pay(interaction: discord.Interaction, user: discord.Member, amount: in
     await bot.db.add_coins(interaction.guild_id, interaction.user.id, -amount)
     await bot.db.add_coins(interaction.guild_id, user.id, amount)
     await interaction.response.send_message(
-        f"{config.COIN_EMOJI} {interaction.user.mention} sent **{amount}** "
+        f"{config.COIN_EMOJI} {interaction.user.mention} sent **{fmt_coins(amount)}** "
         f"{config.COIN_NAME}(s) to {user.mention}!"
     )
 
@@ -709,7 +742,8 @@ async def buy(interaction: discord.Interaction, product: app_commands.Choice[str
     u = await bot.db.get_user(guild_id, uid)
     if u["coins"] < cost:
         await interaction.response.send_message(
-            f"You need **{cost}** {config.COIN_NAME}(s) but only have **{u['coins']}**.",
+            f"You need **{cost}** {config.COIN_NAME}(s) but only have "
+            f"**{fmt_coins(u['coins'])}**.",
             ephemeral=True,
         )
         return
@@ -866,26 +900,26 @@ class AdminGroup(app_commands.Group):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="addcoins", description="Add (or subtract) a user's coins")
-    @app_commands.describe(user="Member", amount="Amount (use a negative number to remove)")
-    async def addcoins(self, interaction: discord.Interaction, user: discord.Member, amount: int):
-        new = await self.bot.db.add_coins(interaction.guild_id, user.id, amount)
+    @app_commands.describe(user="Member", amount="Amount (decimals allowed; negative to remove)")
+    async def addcoins(self, interaction: discord.Interaction, user: discord.Member, amount: float):
+        new = await self.bot.db.add_coins(interaction.guild_id, user.id, round_coins(amount))
         await interaction.response.send_message(
-            f"{user.mention} now has **{new}** {config.COIN_NAME}(s).", ephemeral=True
+            f"{user.mention} now has **{fmt_coins(new)}** {config.COIN_NAME}(s).", ephemeral=True
         )
 
     @app_commands.command(name="removecoins", description="Remove coins from a user")
-    @app_commands.describe(user="Member", amount="How many to remove")
-    async def removecoins(self, interaction: discord.Interaction, user: discord.Member, amount: int):
-        new = await self.bot.db.add_coins(interaction.guild_id, user.id, -abs(amount))
+    @app_commands.describe(user="Member", amount="How many to remove (decimals allowed)")
+    async def removecoins(self, interaction: discord.Interaction, user: discord.Member, amount: float):
+        new = await self.bot.db.add_coins(interaction.guild_id, user.id, -abs(round_coins(amount)))
         await interaction.response.send_message(
-            f"{user.mention} now has **{new}** {config.COIN_NAME}(s).", ephemeral=True
+            f"{user.mention} now has **{fmt_coins(new)}** {config.COIN_NAME}(s).", ephemeral=True
         )
 
     @app_commands.command(name="setcoins", description="Set a user's coin balance")
-    async def setcoins(self, interaction: discord.Interaction, user: discord.Member, amount: int):
-        new = await self.bot.db.set_coins(interaction.guild_id, user.id, amount)
+    async def setcoins(self, interaction: discord.Interaction, user: discord.Member, amount: float):
+        new = await self.bot.db.set_coins(interaction.guild_id, user.id, round_coins(amount))
         await interaction.response.send_message(
-            f"Set {user.mention} to **{new}** {config.COIN_NAME}(s).", ephemeral=True
+            f"Set {user.mention} to **{fmt_coins(new)}** {config.COIN_NAME}(s).", ephemeral=True
         )
 
     @app_commands.command(name="setrequiredstatus", description="Set the required custom-status text")
@@ -938,7 +972,7 @@ class AdminGroup(app_commands.Group):
     async def reset(self, interaction: discord.Interaction, user: discord.Member):
         await self.bot.db.upsert_user(
             interaction.guild_id, user.id,
-            total_eligible_seconds=0, coins=0, rewards_count=0,
+            total_eligible_seconds=0, coins=0, earned_coins=0, rewards_count=0,
         )
         self.bot.eligible_since.pop((interaction.guild_id, user.id), None)
         await interaction.response.send_message(f"Reset {user.mention}.", ephemeral=True)
