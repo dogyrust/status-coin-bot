@@ -4,6 +4,15 @@ import time
 
 import aiosqlite
 
+# Coins are tracked to a hundredth of a coin (1 "cent"). Every balance that is
+# written goes through round_coins so floating-point accrual never drifts.
+COIN_STEP = 0.01
+
+
+def round_coins(amount):
+    """Round a coin amount to the nearest 0.01, never returning -0.0."""
+    return round(float(amount) + 0.0, 2)
+
 # Only these setting columns may be updated programmatically.
 _ALLOWED_SETTING_KEYS = {
     "required_status",
@@ -17,6 +26,7 @@ _ALLOWED_SETTING_KEYS = {
 _ALLOWED_USER_KEYS = {
     "total_eligible_seconds",
     "coins",
+    "earned_coins",
     "rewards_count",
     "updated_at",
 }
@@ -35,6 +45,7 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL;")
         await self._create_tables()
+        await self._migrate()
         await self._conn.commit()
 
     async def close(self):
@@ -61,7 +72,8 @@ class Database:
                 guild_id INTEGER,
                 user_id INTEGER,
                 total_eligible_seconds REAL DEFAULT 0,
-                coins INTEGER DEFAULT 0,
+                coins REAL DEFAULT 0,
+                earned_coins REAL DEFAULT 0,
                 rewards_count INTEGER DEFAULT 0,
                 updated_at REAL DEFAULT 0,
                 PRIMARY KEY (guild_id, user_id)
@@ -77,6 +89,29 @@ class Database:
             )
             """
         )
+
+    async def _migrate(self):
+        """Add columns introduced after the original schema (idempotent)."""
+        cur = await self._conn.execute("PRAGMA table_info(users)")
+        cols = {row["name"] for row in await cur.fetchall()}
+        if "earned_coins" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE users ADD COLUMN earned_coins REAL DEFAULT 0"
+            )
+            # Existing members were already paid `rewards_count * coins_per_reward`
+            # in lump sums under the old model. Seed earned_coins to that so the
+            # new continuous accrual only ever credits the unpaid remainder and
+            # never double-pays for time already rewarded.
+            await self._conn.execute(
+                """
+                UPDATE users
+                   SET earned_coins = rewards_count * COALESCE(
+                       (SELECT s.coins_per_reward FROM settings s
+                         WHERE s.guild_id = users.guild_id),
+                       1
+                   )
+                """
+            )
 
     # ---------- settings ----------
     async def get_settings(self, guild_id, defaults):
@@ -131,7 +166,8 @@ class Database:
                 "guild_id": guild_id,
                 "user_id": user_id,
                 "total_eligible_seconds": 0.0,
-                "coins": 0,
+                "coins": 0.0,
+                "earned_coins": 0.0,
                 "rewards_count": 0,
                 "updated_at": now,
             }
@@ -153,12 +189,12 @@ class Database:
 
     async def add_coins(self, guild_id, user_id, amount):
         u = await self.get_user(guild_id, user_id)
-        new = max(0, u["coins"] + amount)
+        new = round_coins(max(0.0, u["coins"] + amount))
         await self.upsert_user(guild_id, user_id, coins=new)
         return new
 
     async def set_coins(self, guild_id, user_id, amount):
-        new = max(0, amount)
+        new = round_coins(max(0.0, amount))
         await self.upsert_user(guild_id, user_id, coins=new)
         return new
 
@@ -170,8 +206,8 @@ class Database:
         returned.
         """
         u = await self.get_user(guild_id, user_id)
-        current = u["coins"]
-        new = current + delta
+        current = round_coins(u["coins"])
+        new = round_coins(current + delta)
         if new < 0:
             return False, current
         await self.upsert_user(guild_id, user_id, coins=new)
