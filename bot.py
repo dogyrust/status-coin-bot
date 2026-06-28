@@ -766,6 +766,72 @@ async def buy(interaction: discord.Interaction, product: app_commands.Choice[str
         bot._buying.discard(key)
 
 
+@bot.tree.command(
+    name="replace",
+    description="Replace an invalid account key (within the 3-hour warranty)",
+)
+@app_commands.guild_only()
+@app_commands.describe(key="Your activation key to check / replace")
+async def replace(interaction: discord.Interaction, key: str):
+    key = key.strip()
+    if not key:
+        await interaction.response.send_message(
+            "Please provide your activation key.", ephemeral=True
+        )
+        return
+    if not config.NFA_API_KEY:
+        await interaction.response.send_message(
+            "Replacements aren't configured yet (an admin must set `NFA_API_KEY`).",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        _, data = await bot.nfa_post(
+            "/api/v1/check_account", {"activation_key": key}, timeout=30
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("check_account error: %s", exc)
+        await _safe_followup(
+            interaction,
+            content="Couldn't reach the replacement service \u2014 please try again shortly.",
+            ephemeral=True,
+        )
+        return
+
+    result = data.get("result") if isinstance(data, dict) else None
+    message = data.get("message") if isinstance(data, dict) else None
+
+    if result == "valid":
+        await _safe_followup(
+            interaction,
+            content="\u2705 That account is still **valid** \u2014 no replacement needed.",
+            ephemeral=True,
+        )
+    elif result == "replaced":
+        replacement = data.get("replacement_key") if isinstance(data, dict) else None
+        body = "\U0001F504 Your account was **replaced** under the 3-hour warranty.\n\n"
+        if replacement:
+            body += (
+                f"**New key:** ||`{replacement}`||\n\n"
+                f"Activate it at {ACTIVATION_URL} \u2014 keep it private, treat it like cash."
+            )
+        else:
+            body += "Check the panel for your new replacement key."
+        await _safe_followup(interaction, content=body, ephemeral=True)
+    else:
+        note = message or (
+            "the account is still valid or outside the 3-hour warranty window"
+        )
+        await _safe_followup(
+            interaction,
+            content=f"\u274C No replacement issued \u2014 {note}. "
+            "If you think this is a mistake, contact support.",
+            ephemeral=True,
+        )
+
+
 # --------------------------- admin commands ---------------------------
 @app_commands.guild_only()
 class AdminGroup(app_commands.Group):
