@@ -20,6 +20,7 @@ they are online **and** displaying the status.
   - `/leaderboard` - top coin holders
   - `/pay <user> <amount>` - transfer coins
   - `/howitworks` - explains the system
+  - `/replace <key>` - replace an invalid account key within the 3-hour warranty
 - Admin commands (require **Manage Server**), under `/admin`:
   - `addcoins`, `removecoins`, `setcoins`, `reset`
   - `setrequiredstatus`, `setrewardhours`, `setcoinsperreward`
