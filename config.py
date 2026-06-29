@@ -89,6 +89,13 @@ DEFAULT_STORE_TIERS = [
     {"account_type": "rust_0_250_hours", "label": "Rust 0-250 hours (Base)", "cost": 1},
     {"account_type": "rust_500_1000_hours", "label": "Rust 500-1000 hours", "cost": 3},
     {"account_type": "rust_3000_7000_hours", "label": "Rust 3000-7000 hours", "cost": 4},
+    {"account_type": "arc_0_99_hours", "label": "Arc 0-99 hours", "cost": 1},
+    {"account_type": "arc_100_200_hours", "label": "Arc 100-200 hours", "cost": 3},
+    {"account_type": "arc_200_plus_hours", "label": "Arc 200+ hours", "cost": 5},
+    {"account_type": "cs2_prime", "label": "CS2 Prime", "cost": 1},
+    {"account_type": "cs2_premier", "label": "CS2 Premier", "cost": 1},
+    {"account_type": "cs2_10_15k_elo", "label": "CS2 10-15k ELO", "cost": 2},
+    {"account_type": "cs2_15_20k_elo", "label": "CS2 15-20k ELO", "cost": 3},
 ]
 try:
     STORE_TIERS = json.loads(os.getenv("STORE_TIERS", "")) or DEFAULT_STORE_TIERS
