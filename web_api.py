@@ -7,6 +7,7 @@ player's balance and to apply the result of a bet.
 Endpoints (all under the configured guild):
   GET  /health                      -> {"ok": true}
   GET  /api/coins/balance?user_id=  -> {"user_id", "coins"}
+  GET  /api/coins/leaderboard?limit= -> {"leaderboard": [{"user_id", "coins"}, ...]}
   POST /api/coins/adjust            -> {"user_id", "coins", "applied"}
        body: {"user_id": <int>, "delta": <int>}
 
@@ -69,6 +70,7 @@ class CoinApiServer:
             [
                 web.get("/health", self.handle_health),
                 web.get("/api/coins/balance", self.handle_balance),
+                web.get("/api/coins/leaderboard", self.handle_leaderboard),
                 web.post("/api/coins/adjust", self.handle_adjust),
             ]
         )
@@ -95,6 +97,24 @@ class CoinApiServer:
             return web.json_response({"error": "invalid user_id"}, status=400)
         user = await self.bot.db.get_user(self.guild_id, user_id)
         return web.json_response({"user_id": user_id, "coins": user["coins"]})
+
+    async def handle_leaderboard(self, request):
+        if not _require_key(request):
+            return _unauthorized()
+        try:
+            limit = int(request.query.get("limit", 10))
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid limit"}, status=400)
+        limit = max(1, min(limit, 50))
+        rows = await self.bot.db.leaderboard(self.guild_id, limit)
+        return web.json_response(
+            {
+                "leaderboard": [
+                    {"user_id": row["user_id"], "coins": row["coins"]}
+                    for row in rows
+                ]
+            }
+        )
 
     async def handle_adjust(self, request):
         if not _require_key(request):
