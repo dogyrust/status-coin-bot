@@ -187,9 +187,10 @@ class StatusBot(commands.Bot):
             return resp.status, data
 
     async def get_store(self):
-        """Return (accounts: {name: price}, stock: {name: count}); cached ~15s."""
+        """Return (accounts: {name: price}, stock: {name: count}); cached 2 min
+        to protect the NFA rate limit."""
         now = time.time()
-        if self._store_cache and now - self._store_cache[0] < 15:
+        if self._store_cache and now - self._store_cache[0] < 120:
             return self._store_cache[1]
         _, acc = await self.nfa_get("/api/v1/accounts")
         _, stk = await self.nfa_get("/api/v1/stock")
@@ -393,6 +394,16 @@ bot = StatusBot()
 async def on_app_command_error(
     interaction: discord.Interaction, error: app_commands.AppCommandError
 ):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        msg = f"\u23F3 Slow down \u2014 try again in {error.retry_after:.0f}s."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+        return
     if isinstance(error, app_commands.CheckFailure):
         # Authorisation message was already sent in the check itself.
         if not interaction.response.is_done():
@@ -682,6 +693,7 @@ async def _deliver_key(interaction: discord.Interaction, tier, key):
 
 @bot.tree.command(name="buy", description="Spend coins to receive an account key")
 @app_commands.guild_only()
+@app_commands.checks.cooldown(1, 120.0, key=lambda i: i.user.id)
 @app_commands.choices(product=_STORE_CHOICES)
 @app_commands.describe(product="Which account to buy")
 async def buy(interaction: discord.Interaction, product: app_commands.Choice[str]):
@@ -771,6 +783,7 @@ async def buy(interaction: discord.Interaction, product: app_commands.Choice[str
     description="Replace an invalid account key (within the 3-hour warranty)",
 )
 @app_commands.guild_only()
+@app_commands.checks.cooldown(1, 120.0, key=lambda i: i.user.id)
 @app_commands.describe(key="Your activation key to check / replace")
 async def replace(interaction: discord.Interaction, key: str):
     key = key.strip()
